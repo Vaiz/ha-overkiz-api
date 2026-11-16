@@ -8,13 +8,58 @@ from unittest.mock import AsyncMock, patch
 import aiohttp
 import pytest
 
-from pyoverkiz.client import OverkizClient
+from pyoverkiz.client import OverkizClient, retry_on_connection_failure
 from pyoverkiz.exceptions import (
     BadCredentialsError,
     InvalidEventListenerIdError,
     NotAuthenticatedError,
 )
 from tests.helpers import MockResponse
+
+
+@pytest.mark.asyncio
+async def test_repeated_polling_reuses_retry_wrappers(client: OverkizClient) -> None:
+    """Polling and unregistering must not grow the shared backoff handler lists."""
+    with (
+        patch(
+            "pyoverkiz.client.retry_on_connection_failure",
+            wraps=retry_on_connection_failure,
+        ) as retry_decorator,
+        patch.object(
+            client._auth, "refresh_if_needed", new=AsyncMock(return_value=False)
+        ),
+        patch.object(client, "_post", new=AsyncMock(return_value=[])),
+    ):
+        for _ in range(20):
+            client._event_listener_id = "listener"
+            assert await client.fetch_events() == []
+            await client.unregister_event_listener()
+
+    await client.session.close()
+    retry_decorator.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_retry_budget_is_bounded(client: OverkizClient) -> None:
+    """Both refresh entry points must retain the three-attempt transport budget."""
+    client._event_listener_id = "listener"
+    with (
+        patch("backoff._async.asyncio.sleep", new=AsyncMock()),
+        patch.object(
+            client._auth,
+            "refresh_if_needed",
+            new=AsyncMock(side_effect=TimeoutError("offline")),
+        ) as refresh,
+        patch.object(client, "_post", new=AsyncMock()) as post,
+    ):
+        for operation in (client.fetch_events, client.unregister_event_listener):
+            refresh.reset_mock()
+            with pytest.raises(TimeoutError):
+                await operation()
+            assert refresh.await_count == 3
+            post.assert_not_awaited()
+
+    await client.session.close()
 
 
 @pytest.mark.asyncio
